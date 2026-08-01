@@ -3,8 +3,8 @@ from vllm import LLM, SamplingParams
 
 
 MODEL = (
-    ".hf_cache/hub/models--Qwen--Qwen3.5-2B/"
-    "snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc"
+    ".hf_cache/hub/models--Qwen--Qwen3-1.7B/"
+    "snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 )
 
 
@@ -13,6 +13,7 @@ def build_prompt(tokenizer, messages):
         messages,
         tokenize=False,
         add_generation_prompt=True,
+        enable_thinking=False,
     )
 
 
@@ -21,17 +22,17 @@ def main() -> None:
     llm = LLM(
         model=MODEL,
         dtype="float16",
-        max_model_len=512,
+        max_model_len=2048,
         max_num_seqs=1,
-        gpu_memory_utilization=0.82,
+        gpu_memory_utilization=0.65,
+        kv_cache_memory_bytes=512 * 1024 * 1024,
         enforce_eager=True,
         tensor_parallel_size=1,
-        limit_mm_per_prompt={"image": 0, "video": 0},
     )
     sampling_params = SamplingParams(
         temperature=0.4,
         top_p=0.9,
-        max_tokens=128,
+        max_tokens=256,
     )
 
     messages = [
@@ -41,7 +42,7 @@ def main() -> None:
         }
     ]
 
-    print("Qwen interactive chat. Type /exit to quit, /clear to reset context.")
+    print("Qwen3-1.7B interactive chat. Type /exit to quit, /clear to reset.")
     while True:
         try:
             user_message = input("\n你: ").strip()
