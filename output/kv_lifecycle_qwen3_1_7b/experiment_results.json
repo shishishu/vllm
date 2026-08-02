@@ -1,0 +1,47 @@
+[
+  {
+    "request_id": "0",
+    "prompt_tokens": 128,
+    "output_tokens": 1
+  },
+  {
+    "request_id": "1",
+    "prompt_tokens": 128,
+    "output_tokens": 32
+  },
+  {
+    "request_id": "2",
+    "prompt_tokens": 128,
+    "output_tokens": 128
+  },
+  {
+    "request_id": "3",
+    "prompt_tokens": 512,
+    "output_tokens": 1
+  },
+  {
+    "request_id": "4",
+    "prompt_tokens": 512,
+    "output_tokens": 32
+  },
+  {
+    "request_id": "5",
+    "prompt_tokens": 512,
+    "output_tokens": 128
+  },
+  {
+    "request_id": "6",
+    "prompt_tokens": 2048,
+    "output_tokens": 1
+  },
+  {
+    "request_id": "7",
+    "prompt_tokens": 2048,
+    "output_tokens": 32
+  },
+  {
+    "request_id": "8",
+    "prompt_tokens": 2048,
+    "output_tokens": 128
+  }
+]

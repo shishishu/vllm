@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from concurrent.futures import Future
 from unittest.mock import Mock
 
@@ -126,6 +127,78 @@ def test_finish_request():
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert request.request_id not in scheduler.requests
         assert len(scheduler.waiting) == 9 - i
+
+
+def test_kv_lifecycle_trace_records_request_steps_and_release(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("VLLM_KV_LIFECYCLE_TRACE_DIR", str(tmp_path))
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_chunked_prefill=False,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=32,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=17,
+        max_tokens=2,
+        ignore_eos=True,
+        req_ids=["kv-life"],
+    )[0]
+    initial_free_blocks = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    scheduler.add_request(request)
+
+    for _ in range(2):
+        scheduler_output = scheduler.schedule()
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[1000]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    core_path = next(tmp_path.glob("kv_lifecycle_core_*.jsonl"))
+    detail_path = next(tmp_path.glob("kv_lifecycle_detail_*.jsonl"))
+    core_events = [json.loads(line) for line in core_path.read_text().splitlines()]
+    detail_events = [json.loads(line) for line in detail_path.read_text().splitlines()]
+
+    assert [event["event"] for event in core_events] == [
+        "ENGINE_INIT",
+        "REQUEST_ADD",
+        "STEP_COMPLETE",
+        "STEP_COMPLETE",
+        "FINISH_BEFORE_RELEASE",
+        "FINISH_AFTER_RELEASE",
+        "REQUEST_SUMMARY",
+    ]
+    assert [event["stream_seq"] for event in core_events] == list(range(1, 8))
+    step_events = [event for event in core_events if event["event"] == "STEP_COMPLETE"]
+    assert [event["phase"] for event in step_events] == ["PREFILL", "DECODE"]
+    assert [event["num_scheduled_tokens"] for event in step_events] == [17, 1]
+    assert [event["num_output_tokens"] for event in step_events] == [1, 2]
+    assert all(event["total_block_references"] == 2 for event in step_events)
+
+    summary = core_events[-1]
+    assert summary["prompt_tokens"] == 17
+    assert summary["output_tokens"] == 2
+    assert summary["num_computed_tokens"] == 18
+    assert summary["mean_tpot_ms"] is not None
+    assert summary["peak_block_references"] == 2
+    assert summary["initial_free_blocks"] == initial_free_blocks
+    assert summary["final_free_blocks"] == initial_free_blocks
+
+    release = next(
+        event for event in detail_events if event["event"] == "FINISH_AFTER_RELEASE"
+    )
+    assert release["released_block_ids_by_group"]
+    assert release["released_ref_cnt_by_group"] == [[0, 0]]
 
 
 def test_get_num_unfinished_requests():

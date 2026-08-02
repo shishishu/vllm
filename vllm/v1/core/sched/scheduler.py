@@ -38,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_lifecycle import KVLifecycleTracer
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -287,6 +288,21 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+        )
+        self.kv_lifecycle_tracer = KVLifecycleTracer.from_env(
+            self.kv_cache_manager,
+            {
+                "block_size_tokens": self.block_size,
+                "max_model_len": self.max_model_len,
+                "max_num_seqs": self.max_num_running_reqs,
+                "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+                "enable_chunked_prefill": (
+                    self.scheduler_config.enable_chunked_prefill
+                ),
+                "enable_prefix_caching": self.cache_config.enable_prefix_caching,
+                "async_scheduling": self.scheduler_config.async_scheduling,
+                "num_speculative_tokens": self.num_spec_tokens,
+            },
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1250,6 +1266,18 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self.kv_lifecycle_tracer is not None:
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                request = self.requests[req_id]
+                self.kv_lifecycle_tracer.on_schedule(
+                    request=request,
+                    engine_step=self.current_step,
+                    schedule_start=scheduled_timestamp,
+                    num_computed_tokens_before=(
+                        request.num_computed_tokens - num_tokens
+                    ),
+                    num_scheduled_tokens=num_tokens,
+                )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1814,6 +1842,9 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if self.kv_lifecycle_tracer is not None:
+                self.kv_lifecycle_tracer.on_step_output(request, len(new_token_ids))
+
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
             ):
@@ -2233,6 +2264,8 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            if self.kv_lifecycle_tracer is not None:
+                self.kv_lifecycle_tracer.on_request_add(request)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2302,6 +2335,9 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.kv_lifecycle_tracer is not None:
+            self.kv_lifecycle_tracer.on_finish_before_release(request)
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2329,6 +2365,8 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        if self.kv_lifecycle_tracer is not None:
+            self.kv_lifecycle_tracer.on_finish_after_release(request)
         del self.requests[request.request_id]
 
     @property
