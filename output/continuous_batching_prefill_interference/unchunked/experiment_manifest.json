@@ -1,0 +1,153 @@
+{
+  "chunked_prefill": false,
+  "max_num_batched_tokens": 4096,
+  "repetitions": 5,
+  "workload": {
+    "ongoing": {
+      "prompt_tokens": 128,
+      "output_tokens": 16
+    },
+    "newcomer": {
+      "prompt_tokens": 16,
+      "output_tokens": 1
+    },
+    "long": {
+      "prompt_tokens": 2049,
+      "output_tokens": 1
+    }
+  },
+  "trials": [
+    {
+      "trial": "warmup-baseline",
+      "condition": "baseline",
+      "measured": false,
+      "elapsed_after_arrival_ms": 364.6066829969641,
+      "requests": {
+        "ongoing": "warmup-baseline-ongoing-b381b863",
+        "newcomer": "warmup-baseline-newcomer-a013bba4",
+        "long": null
+      }
+    },
+    {
+      "trial": "warmup-interference",
+      "condition": "interference",
+      "measured": false,
+      "elapsed_after_arrival_ms": 1133.5002330015413,
+      "requests": {
+        "ongoing": "warmup-interference-ongoing-99725d3b",
+        "newcomer": "warmup-interference-newcomer-88a41218",
+        "long": "warmup-interference-long-8492f703"
+      }
+    },
+    {
+      "trial": "r0-baseline",
+      "condition": "baseline",
+      "measured": true,
+      "elapsed_after_arrival_ms": 364.06350300239865,
+      "requests": {
+        "ongoing": "r0-baseline-ongoing-b58889f9",
+        "newcomer": "r0-baseline-newcomer-8efaebbe",
+        "long": null
+      }
+    },
+    {
+      "trial": "r0-interference",
+      "condition": "interference",
+      "measured": true,
+      "elapsed_after_arrival_ms": 1151.13861199643,
+      "requests": {
+        "ongoing": "r0-interference-ongoing-93af39b3",
+        "newcomer": "r0-interference-newcomer-bdbcacb9",
+        "long": "r0-interference-long-8c39a612"
+      }
+    },
+    {
+      "trial": "r1-baseline",
+      "condition": "baseline",
+      "measured": true,
+      "elapsed_after_arrival_ms": 375.86954300059006,
+      "requests": {
+        "ongoing": "r1-baseline-ongoing-850132fa",
+        "newcomer": "r1-baseline-newcomer-ae703d36",
+        "long": null
+      }
+    },
+    {
+      "trial": "r1-interference",
+      "condition": "interference",
+      "measured": true,
+      "elapsed_after_arrival_ms": 1148.4403400099836,
+      "requests": {
+        "ongoing": "r1-interference-ongoing-adf1c4b2",
+        "newcomer": "r1-interference-newcomer-9603ad12",
+        "long": "r1-interference-long-ba33c18b"
+      }
+    },
+    {
+      "trial": "r2-baseline",
+      "condition": "baseline",
+      "measured": true,
+      "elapsed_after_arrival_ms": 354.26588299742434,
+      "requests": {
+        "ongoing": "r2-baseline-ongoing-bbd33024",
+        "newcomer": "r2-baseline-newcomer-96c78b42",
+        "long": null
+      }
+    },
+    {
+      "trial": "r2-interference",
+      "condition": "interference",
+      "measured": true,
+      "elapsed_after_arrival_ms": 1150.093039002968,
+      "requests": {
+        "ongoing": "r2-interference-ongoing-89866b0b",
+        "newcomer": "r2-interference-newcomer-81da1e19",
+        "long": "r2-interference-long-9fe78620"
+      }
+    },
+    {
+      "trial": "r3-baseline",
+      "condition": "baseline",
+      "measured": true,
+      "elapsed_after_arrival_ms": 359.3007320014294,
+      "requests": {
+        "ongoing": "r3-baseline-ongoing-a7e3c140",
+        "newcomer": "r3-baseline-newcomer-a6b7a6dd",
+        "long": null
+      }
+    },
+    {
+      "trial": "r3-interference",
+      "condition": "interference",
+      "measured": true,
+      "elapsed_after_arrival_ms": 1128.8925289991312,
+      "requests": {
+        "ongoing": "r3-interference-ongoing-aeaf1850",
+        "newcomer": "r3-interference-newcomer-99208409",
+        "long": "r3-interference-long-947eeaa1"
+      }
+    },
+    {
+      "trial": "r4-baseline",
+      "condition": "baseline",
+      "measured": true,
+      "elapsed_after_arrival_ms": 369.86400101159234,
+      "requests": {
+        "ongoing": "r4-baseline-ongoing-93fb9937",
+        "newcomer": "r4-baseline-newcomer-a66471ef",
+        "long": null
+      }
+    },
+    {
+      "trial": "r4-interference",
+      "condition": "interference",
+      "measured": true,
+      "elapsed_after_arrival_ms": 1178.6765770084457,
+      "requests": {
+        "ongoing": "r4-interference-ongoing-87bf2f3a",
+        "newcomer": "r4-interference-newcomer-a663c752",
+        "long": "r4-interference-long-817154b1"
+      }
+    }
+  ]
+}
