@@ -47,6 +47,10 @@ class KVLifecycleTracer:
         self._states: dict[str, _RequestTraceState] = {}
         self._event_seq = 0
         self._stream_seq = {"core": 0, "detail": 0}
+        self._block_sizes: tuple[int, ...] = tuple(
+            group.kv_cache_spec.block_size
+            for group in kv_cache_manager.kv_cache_config.kv_cache_groups
+        )
 
         group_config = []
         for group_id, group in enumerate(
@@ -113,15 +117,45 @@ class KVLifecycleTracer:
         self._write(self._core_file, "core", record)
         self._write(self._detail_file, "detail", record)
 
-    def _snapshot(self, request_id: str) -> dict[str, Any]:
+    def _snapshot(self, request_id: str, num_kv_tokens: int) -> dict[str, Any]:
         blocks = self._kv_cache_manager.get_blocks(request_id).blocks
         block_ids = tuple(tuple(block.block_id for block in group) for group in blocks)
         ref_cnts = tuple(tuple(block.ref_cnt for block in group) for group in blocks)
         block_counts = tuple(len(group) for group in blocks)
         total_blocks = sum(block_counts)
         all_ref_cnts = [ref_cnt for group in ref_cnts for ref_cnt in group]
+        mappings = tuple(
+            tuple(
+                {
+                    "logical_block_index": logical_block_index,
+                    "physical_block_id": block.block_id,
+                    "valid_tokens": max(
+                        min(
+                            num_kv_tokens - logical_block_index * block_size,
+                            block_size,
+                        ),
+                        0,
+                    ),
+                    "unused_token_slots": block_size
+                    - max(
+                        min(
+                            num_kv_tokens - logical_block_index * block_size,
+                            block_size,
+                        ),
+                        0,
+                    ),
+                }
+                for logical_block_index, block in enumerate(group)
+            )
+            for group, block_size in zip(
+                blocks,
+                self._block_sizes,
+                strict=True,
+            )
+        )
         return {
             "block_ids_by_group": block_ids,
+            "block_mappings_by_group": mappings,
             "ref_cnt_by_group": ref_cnts,
             "block_count_by_group": block_counts,
             "total_block_references": total_blocks,
@@ -157,6 +191,9 @@ class KVLifecycleTracer:
         schedule_start: float,
         num_computed_tokens_before: int,
         num_scheduled_tokens: int,
+        allocation_duration_ms: float,
+        free_blocks_before_allocation: int,
+        free_blocks_after_allocation: int,
     ) -> None:
         state = self._states.get(request.request_id)
         if state is None:
@@ -169,7 +206,8 @@ class KVLifecycleTracer:
             if num_computed_tokens_before < request.num_prompt_tokens
             else "DECODE"
         )
-        snapshot = self._snapshot(request.request_id)
+        reserved_kv_tokens = request.num_computed_tokens
+        snapshot = self._snapshot(request.request_id, reserved_kv_tokens)
         current_ids = snapshot["block_ids_by_group"]
         previous_ids = state.last_block_ids
         new_block_ids = tuple(
@@ -187,7 +225,11 @@ class KVLifecycleTracer:
             "num_computed_tokens_before": num_computed_tokens_before,
             "num_scheduled_tokens": num_scheduled_tokens,
             "num_computed_tokens_after_schedule": request.num_computed_tokens,
+            "reserved_kv_tokens": reserved_kv_tokens,
             "new_block_count": sum(len(group) for group in new_block_ids),
+            "allocation_duration_ms": allocation_duration_ms,
+            "free_blocks_before_allocation": free_blocks_before_allocation,
+            "free_blocks_after_allocation": free_blocks_after_allocation,
         }
         state.pending_steps.append(step)
         self._write_detail(
@@ -211,7 +253,7 @@ class KVLifecycleTracer:
                 state.first_token_time = now
             state.last_token_time = now
 
-        snapshot = self._snapshot(request.request_id)
+        snapshot = self._snapshot(request.request_id, request.num_computed_tokens)
         state.peak_blocks = max(state.peak_blocks, snapshot["total_block_references"])
         wait_ms = (
             (state.first_schedule_time - state.add_time) * 1000
@@ -235,6 +277,9 @@ class KVLifecycleTracer:
             num_new_output_tokens=num_new_tokens,
             num_output_tokens=request.num_output_tokens,
             new_block_count=step["new_block_count"],
+            allocation_duration_ms=step["allocation_duration_ms"],
+            free_blocks_before_allocation=step["free_blocks_before_allocation"],
+            free_blocks_after_allocation=step["free_blocks_after_allocation"],
             block_count_by_group=snapshot["block_count_by_group"],
             total_block_references=snapshot["total_block_references"],
             ref_cnt_min=snapshot["ref_cnt_min"],
@@ -260,7 +305,7 @@ class KVLifecycleTracer:
             return
         now = time.monotonic()
         state.finish_time = now
-        snapshot = self._snapshot(request.request_id)
+        snapshot = self._snapshot(request.request_id, request.num_computed_tokens)
         common = {
             "request_id": request.request_id,
             "status": str(request.status),
@@ -280,7 +325,12 @@ class KVLifecycleTracer:
         )
         self._write_detail("FINISH_BEFORE_RELEASE", now, **common, **snapshot)
 
-    def on_finish_after_release(self, request: Request) -> None:
+    def on_finish_after_release(
+        self,
+        request: Request,
+        free_duration_ms: float,
+        free_blocks_before_release: int,
+    ) -> None:
         state = self._states.pop(request.request_id, None)
         if state is None:
             return
@@ -330,9 +380,13 @@ class KVLifecycleTracer:
             "mean_tpot_ms": tpot_ms,
             "total_ms": total_ms,
             "release_ms": release_ms,
+            "free_duration_ms": free_duration_ms,
             "peak_block_references": state.peak_blocks,
             "initial_free_blocks": state.initial_free_blocks,
+            "free_blocks_before_release": free_blocks_before_release,
             "final_free_blocks": free_blocks,
+            "num_preemptions": request.num_preemptions,
+            "recompute_occurred": request.num_preemptions > 0,
         }
         self._write_core("FINISH_AFTER_RELEASE", now, **summary)
         self._write_core("REQUEST_SUMMARY", now, **summary)

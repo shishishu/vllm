@@ -189,6 +189,29 @@ def test_kv_lifecycle_trace_records_request_steps_and_release(
     assert [event["num_scheduled_tokens"] for event in step_events] == [17, 1]
     assert [event["num_output_tokens"] for event in step_events] == [1, 2]
     assert all(event["total_block_references"] == 2 for event in step_events)
+    assert all(event["allocation_duration_ms"] >= 0 for event in step_events)
+    assert step_events[0]["free_blocks_before_allocation"] == initial_free_blocks
+    assert step_events[0]["free_blocks_after_allocation"] == initial_free_blocks - 2
+
+    model_steps = [
+        event for event in detail_events if event["event"] == "MODEL_STEP_END"
+    ]
+    assert model_steps[0]["block_mappings_by_group"] == [
+        [
+            {
+                "logical_block_index": 0,
+                "physical_block_id": model_steps[0]["block_ids_by_group"][0][0],
+                "unused_token_slots": 0,
+                "valid_tokens": 16,
+            },
+            {
+                "logical_block_index": 1,
+                "physical_block_id": model_steps[0]["block_ids_by_group"][0][1],
+                "unused_token_slots": 15,
+                "valid_tokens": 1,
+            },
+        ]
+    ]
 
     summary = core_events[-1]
     assert summary["prompt_tokens"] == 17
@@ -198,12 +221,137 @@ def test_kv_lifecycle_trace_records_request_steps_and_release(
     assert summary["peak_block_references"] == 2
     assert summary["initial_free_blocks"] == initial_free_blocks
     assert summary["final_free_blocks"] == initial_free_blocks
+    assert summary["free_duration_ms"] >= 0
+    assert summary["num_preemptions"] == 0
+    assert summary["recompute_occurred"] is False
 
     release = next(
         event for event in detail_events if event["event"] == "FINISH_AFTER_RELEASE"
     )
     assert release["released_block_ids_by_group"]
     assert release["released_ref_cnt_by_group"] == [[0, 0]]
+
+
+@pytest.mark.parametrize(
+    "prompt_tokens,expected_valid_tokens,expected_unused_slots",
+    [
+        (15, [15], 1),
+        (16, [16], 0),
+        (17, [16, 1], 15),
+        (31, [16, 15], 1),
+        (32, [16, 16], 0),
+        (33, [16, 16, 1], 15),
+    ],
+)
+def test_kv_lifecycle_trace_maps_logical_to_physical_blocks(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_tokens: int,
+    expected_valid_tokens: list[int],
+    expected_unused_slots: int,
+):
+    trace_dir = tmp_path / str(prompt_tokens)
+    monkeypatch.setenv("VLLM_KV_LIFECYCLE_TRACE_DIR", str(trace_dir))
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_chunked_prefill=False,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=32,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_tokens,
+        max_tokens=1,
+        ignore_eos=True,
+        req_ids=[f"boundary-{prompt_tokens}"],
+    )[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    detail_path = next(trace_dir.glob("kv_lifecycle_detail_*.jsonl"))
+    events = [json.loads(line) for line in detail_path.read_text().splitlines()]
+    finish = next(
+        event for event in events if event["event"] == "FINISH_BEFORE_RELEASE"
+    )
+    mappings = finish["block_mappings_by_group"][0]
+
+    assert [mapping["logical_block_index"] for mapping in mappings] == list(
+        range(len(expected_valid_tokens))
+    )
+    assert [mapping["valid_tokens"] for mapping in mappings] == expected_valid_tokens
+    assert mappings[-1]["unused_token_slots"] == expected_unused_slots
+    assert len({mapping["physical_block_id"] for mapping in mappings}) == len(mappings)
+
+
+def test_kv_lifecycle_trace_records_continuous_batching(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("VLLM_KV_LIFECYCLE_TRACE_DIR", str(tmp_path))
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        enable_chunked_prefill=False,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=32,
+    )
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=17,
+        max_tokens=2,
+        ignore_eos=True,
+        req_ids=["batch-a", "batch-b"],
+    )
+    initial_free_blocks = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    for request in requests:
+        scheduler.add_request(request)
+
+    for _ in range(2):
+        scheduler_output = scheduler.schedule()
+        req_ids = list(scheduler_output.num_scheduled_tokens)
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+                sampled_token_ids=[[1000] for _ in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    detail_path = next(tmp_path.glob("kv_lifecycle_detail_*.jsonl"))
+    events = [json.loads(line) for line in detail_path.read_text().splitlines()]
+    prefill_steps = [
+        event
+        for event in events
+        if event["event"] == "SCHEDULE_STEP" and event["phase"] == "PREFILL"
+    ]
+    assert {event["request_id"] for event in prefill_steps} == {
+        "batch-a",
+        "batch-b",
+    }
+    assert len({event["engine_step"] for event in prefill_steps}) == 1
+    physical_ids = [set(event["block_ids_by_group"][0]) for event in prefill_steps]
+    assert physical_ids[0].isdisjoint(physical_ids[1])
+
+    releases = [event for event in events if event["event"] == "FINISH_AFTER_RELEASE"]
+    assert len(releases) == 2
+    assert releases[-1]["final_free_blocks"] == initial_free_blocks
+    assert all(event["num_preemptions"] == 0 for event in releases)
 
 
 def test_get_num_unfinished_requests():

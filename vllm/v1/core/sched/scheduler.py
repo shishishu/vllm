@@ -68,6 +68,8 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    kv_lifecycle_tracer: KVLifecycleTracer | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -474,6 +476,24 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        allocation_stats: dict[str, dict[str, float | int]] = {}
+
+        def record_allocation(
+            request_id: str,
+            allocation_start: float,
+            free_blocks_before: int,
+        ) -> None:
+            free_blocks_after = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            stats = allocation_stats.setdefault(
+                request_id,
+                {
+                    "duration_ms": 0.0,
+                    "free_blocks_before": free_blocks_before,
+                    "free_blocks_after": free_blocks_after,
+                },
+            )
+            stats["duration_ms"] += (time.monotonic() - allocation_start) * 1000
+            stats["free_blocks_after"] = free_blocks_after
 
         self.kv_cache_manager.new_step_starts()
 
@@ -578,10 +598,19 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    free_blocks_before = (
+                        self.kv_cache_manager.block_pool.get_num_free_blocks()
+                    )
+                    allocation_start = time.monotonic()
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+                    record_allocation(
+                        request.request_id,
+                        allocation_start,
+                        free_blocks_before,
                     )
 
                     if new_blocks is not None:
@@ -981,6 +1010,10 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                free_blocks_before = (
+                    self.kv_cache_manager.block_pool.get_num_free_blocks()
+                )
+                allocation_start = time.monotonic()
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -993,6 +1026,11 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                )
+                record_allocation(
+                    request.request_id,
+                    allocation_start,
+                    free_blocks_before,
                 )
 
                 if new_blocks is None:
@@ -1264,6 +1302,7 @@ class Scheduler(SchedulerInterface):
         if self.kv_lifecycle_tracer is not None:
             for req_id, num_tokens in num_scheduled_tokens.items():
                 request = self.requests[req_id]
+                stats = allocation_stats[req_id]
                 self.kv_lifecycle_tracer.on_schedule(
                     request=request,
                     engine_step=self.current_step,
@@ -1272,6 +1311,9 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens - num_tokens
                     ),
                     num_scheduled_tokens=num_tokens,
+                    allocation_duration_ms=float(stats["duration_ms"]),
+                    free_blocks_before_allocation=int(stats["free_blocks_before"]),
+                    free_blocks_after_allocation=int(stats["free_blocks_after"]),
                 )
         return scheduler_output
 
@@ -2370,9 +2412,15 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        free_blocks_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        free_start = time.monotonic()
         self._free_request_blocks(request)
         if self.kv_lifecycle_tracer is not None:
-            self.kv_lifecycle_tracer.on_finish_after_release(request)
+            self.kv_lifecycle_tracer.on_finish_after_release(
+                request,
+                free_duration_ms=(time.monotonic() - free_start) * 1000,
+                free_blocks_before_release=free_blocks_before,
+            )
         del self.requests[request.request_id]
 
     @property
