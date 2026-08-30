@@ -178,13 +178,14 @@ def test_kv_lifecycle_trace_records_request_steps_and_release(
     assert [event["event"] for event in core_events] == [
         "ENGINE_INIT",
         "REQUEST_ADD",
+        "PREFIX_LOOKUP",
         "STEP_COMPLETE",
         "STEP_COMPLETE",
         "FINISH_BEFORE_RELEASE",
         "FINISH_AFTER_RELEASE",
         "REQUEST_SUMMARY",
     ]
-    assert [event["stream_seq"] for event in core_events] == list(range(1, 8))
+    assert [event["stream_seq"] for event in core_events] == list(range(1, 9))
     step_events = [event for event in core_events if event["event"] == "STEP_COMPLETE"]
     assert [event["phase"] for event in step_events] == ["PREFILL", "DECODE"]
     assert [event["num_scheduled_tokens"] for event in step_events] == [17, 1]
@@ -231,6 +232,163 @@ def test_kv_lifecycle_trace_records_request_steps_and_release(
     )
     assert release["released_block_ids_by_group"]
     assert release["released_ref_cnt_by_group"] == [[0, 0]]
+
+
+def test_kv_lifecycle_trace_records_prefix_cache_reuse(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("VLLM_KV_LIFECYCLE_TRACE_DIR", str(tmp_path))
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_chunked_prefill=False,
+        enable_prefix_caching=True,
+        block_size=16,
+        num_blocks=32,
+    )
+    seed, probe = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        max_tokens=1,
+        ignore_eos=True,
+        same_prompt=True,
+        req_ids=["prefix-seed", "prefix-probe"],
+    )
+
+    for request in (seed, probe):
+        scheduler.add_request(request)
+        scheduler_output = scheduler.schedule()
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[1000]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    core_path = next(tmp_path.glob("kv_lifecycle_core_*.jsonl"))
+    detail_path = next(tmp_path.glob("kv_lifecycle_detail_*.jsonl"))
+    core = [json.loads(line) for line in core_path.read_text().splitlines()]
+    detail = [json.loads(line) for line in detail_path.read_text().splitlines()]
+
+    request_adds = [event for event in core if event["event"] == "REQUEST_ADD"]
+    assert (
+        request_adds[0]["prompt_token_ids_sha256"]
+        == request_adds[1]["prompt_token_ids_sha256"]
+    )
+    lookups = [event for event in core if event["event"] == "PREFIX_LOOKUP"]
+    assert [event["prefix_hit_tokens"] for event in lookups] == [0, 16]
+    assert lookups[1]["prompt_tokens_to_compute"] == 16
+
+    probe_lookup = next(
+        event
+        for event in detail
+        if event["event"] == "PREFIX_LOOKUP" and event["request_id"] == "prefix-probe"
+    )
+    assert probe_lookup["hit_block_ref_cnt_before_touch_by_group"] == [[0]]
+    probe_schedule = next(
+        event
+        for event in detail
+        if event["event"] == "SCHEDULE_STEP" and event["request_id"] == "prefix-probe"
+    )
+    assert probe_schedule["reused_block_count"] == 1
+    assert probe_schedule["allocated_block_count"] == 1
+    assert (
+        probe_schedule["reused_block_ids_by_group"]
+        == probe_lookup["hit_block_ids_by_group"]
+    )
+
+    seed_release = next(
+        event
+        for event in detail
+        if event["event"] == "FINISH_AFTER_RELEASE"
+        and event["request_id"] == "prefix-seed"
+    )
+    assert seed_release["released_ref_cnt_by_group"] == [[0, 0]]
+    assert seed_release["released_cached_by_group"] == [[True, True]]
+
+    assert scheduler.reset_prefix_cache()
+    core = [json.loads(line) for line in core_path.read_text().splitlines()]
+    reset = [event for event in core if event["event"] == "PREFIX_CACHE_RESET"][-1]
+    assert reset["successful"] is True
+    assert reset["cached_hash_entries"] == 0
+
+
+def test_kv_lifecycle_trace_records_concurrent_prefix_sharing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("VLLM_KV_LIFECYCLE_TRACE_DIR", str(tmp_path))
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        enable_chunked_prefill=False,
+        enable_prefix_caching=True,
+        block_size=16,
+        num_blocks=64,
+    )
+    seed = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=1,
+        ignore_eos=True,
+        same_prompt=True,
+        req_ids=["shared-seed"],
+    )[0]
+    scheduler.add_request(seed)
+    seed_output = scheduler.schedule()
+    scheduler.update_from_output(
+        seed_output,
+        ModelRunnerOutput(
+            req_ids=[seed.request_id],
+            req_id_to_index={seed.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    probes = create_requests(
+        num_requests=3,
+        num_tokens=32,
+        max_tokens=1,
+        ignore_eos=True,
+        same_prompt=True,
+        req_ids=["shared-0", "shared-1", "shared-2"],
+    )
+    for probe in probes:
+        scheduler.add_request(probe)
+    probe_output = scheduler.schedule()
+    scheduler.update_from_output(
+        probe_output,
+        ModelRunnerOutput(
+            req_ids=[probe.request_id for probe in probes],
+            req_id_to_index={
+                probe.request_id: index for index, probe in enumerate(probes)
+            },
+            sampled_token_ids=[[1000] for _ in probes],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    detail_path = next(tmp_path.glob("kv_lifecycle_detail_*.jsonl"))
+    detail = [json.loads(line) for line in detail_path.read_text().splitlines()]
+    probe_lookups = [
+        event
+        for event in detail
+        if event["event"] == "PREFIX_LOOKUP"
+        and event["request_id"].startswith("shared-")
+        and event["request_id"] != "shared-seed"
+    ]
+    assert [event["prefix_hit_tokens"] for event in probe_lookups] == [16, 16, 16]
+    assert [
+        event["hit_block_ref_cnt_before_touch_by_group"] for event in probe_lookups
+    ] == [[[0]], [[1]], [[2]]]
+    assert len({event["hit_block_ids_by_group"][0][0] for event in probe_lookups}) == 1
 
 
 @pytest.mark.parametrize(

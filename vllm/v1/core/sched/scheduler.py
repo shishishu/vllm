@@ -882,12 +882,21 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
+                    prefix_lookup_start = time.monotonic()
                     (
                         new_computed_blocks,
                         num_new_local_computed_tokens,
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    if self.kv_lifecycle_tracer is not None:
+                        self.kv_lifecycle_tracer.on_prefix_lookup(
+                            request=request,
+                            computed_blocks=new_computed_blocks,
+                            num_cached_tokens=num_new_local_computed_tokens,
+                            lookup_duration_ms=(time.monotonic() - prefix_lookup_start)
+                            * 1000,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -2713,6 +2722,9 @@ class Scheduler(SchedulerInterface):
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
+
+        if self.kv_lifecycle_tracer is not None:
+            self.kv_lifecycle_tracer.on_prefix_cache_reset(reset_successful)
 
         return reset_successful
 

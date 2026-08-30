@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import json
 import os
 import time
@@ -24,6 +25,10 @@ class _RequestTraceState:
     peak_blocks: int = 0
     initial_free_blocks: int = 0
     last_block_ids: tuple[tuple[int, ...], ...] = ()
+    prefix_hit_block_ids: tuple[tuple[int, ...], ...] = ()
+    prefix_hit_tokens: int = 0
+    prefix_lookup_duration_ms: float = 0.0
+    prefill_tokens_scheduled: int = 0
     pending_steps: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -51,6 +56,10 @@ class KVLifecycleTracer:
             group.kv_cache_spec.block_size
             for group in kv_cache_manager.kv_cache_config.kv_cache_groups
         )
+        self._hash_block_size = kv_cache_manager.block_pool.hash_block_size
+        self._prefix_cache_enabled = bool(
+            engine_config.get("enable_prefix_caching", False)
+        )
 
         group_config = []
         for group_id, group in enumerate(
@@ -73,6 +82,40 @@ class KVLifecycleTracer:
             cache_groups=group_config,
             **engine_config,
         )
+
+    @staticmethod
+    def _token_ids_sha256(token_ids: list[int]) -> str:
+        payload = json.dumps(token_ids, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _hash_hex(block_hash: bytes | None) -> str | None:
+        return bytes(block_hash).hex() if block_hash is not None else None
+
+    def _prompt_hash_records(self, request: Request) -> list[dict[str, Any]]:
+        prompt_token_ids = list(request.all_token_ids[: request.num_prompt_tokens])
+        num_prompt_hashes = request.num_prompt_tokens // self._hash_block_size
+        records = []
+        for block_index in range(num_prompt_hashes):
+            start = block_index * self._hash_block_size
+            end = start + self._hash_block_size
+            block_hash = (
+                request.block_hashes[block_index]
+                if block_index < len(request.block_hashes)
+                else None
+            )
+            records.append(
+                {
+                    "hash_block_index": block_index,
+                    "token_start": start,
+                    "token_end": end,
+                    "token_ids_sha256": self._token_ids_sha256(
+                        prompt_token_ids[start:end]
+                    ),
+                    "prefix_block_hash": self._hash_hex(block_hash),
+                }
+            )
+        return records
 
     @classmethod
     def from_env(
@@ -172,6 +215,9 @@ class KVLifecycleTracer:
             initial_free_blocks=free_blocks,
         )
         sampling_params = request.sampling_params
+        prompt_token_ids = list(request.all_token_ids[: request.num_prompt_tokens])
+        prompt_sha256 = self._token_ids_sha256(prompt_token_ids)
+        prompt_hash_records = self._prompt_hash_records(request)
         self._write_both(
             "REQUEST_ADD",
             now,
@@ -180,8 +226,67 @@ class KVLifecycleTracer:
             max_output_tokens=request.max_tokens,
             min_output_tokens=(sampling_params.min_tokens if sampling_params else None),
             ignore_eos=(sampling_params.ignore_eos if sampling_params else None),
+            prompt_token_ids_sha256=prompt_sha256,
+            prompt_hash_block_count=len(prompt_hash_records),
+            hash_block_size_tokens=self._hash_block_size,
+            prefix_cache_enabled=self._prefix_cache_enabled,
             status=str(request.status),
             num_free_blocks=free_blocks,
+        )
+        self._write_detail(
+            "PROMPT_HASHES",
+            now,
+            request_id=request.request_id,
+            prompt_token_ids_sha256=prompt_sha256,
+            prompt_tokens=request.num_prompt_tokens,
+            hash_block_size_tokens=self._hash_block_size,
+            prompt_block_hashes=prompt_hash_records,
+        )
+
+    def on_prefix_lookup(
+        self,
+        request: Request,
+        computed_blocks: Any,
+        num_cached_tokens: int,
+        lookup_duration_ms: float,
+    ) -> None:
+        state = self._states.get(request.request_id)
+        if state is None:
+            return
+        now = time.monotonic()
+        blocks = computed_blocks.blocks
+        block_ids = tuple(tuple(block.block_id for block in group) for group in blocks)
+        ref_cnts = tuple(tuple(block.ref_cnt for block in group) for group in blocks)
+        physical_hashes = tuple(
+            tuple(self._hash_hex(block.block_hash) for block in group)
+            for group in blocks
+        )
+        state.prefix_hit_block_ids = block_ids
+        state.prefix_hit_tokens = num_cached_tokens
+        state.prefix_lookup_duration_ms = lookup_duration_ms
+        max_cache_hit_tokens = max(request.num_prompt_tokens - 1, 0)
+        common = {
+            "request_id": request.request_id,
+            "prefix_cache_enabled": self._prefix_cache_enabled,
+            "prompt_tokens": request.num_prompt_tokens,
+            "max_cache_hit_tokens": max_cache_hit_tokens,
+            "prefix_hit_tokens": num_cached_tokens,
+            "prefix_hit_block_references": sum(len(group) for group in block_ids),
+            "prompt_tokens_to_compute": request.num_prompt_tokens - num_cached_tokens,
+            "lookup_duration_ms": lookup_duration_ms,
+            "num_free_blocks": (
+                self._kv_cache_manager.block_pool.get_num_free_blocks()
+            ),
+        }
+        self._write_core("PREFIX_LOOKUP", now, **common)
+        self._write_detail(
+            "PREFIX_LOOKUP",
+            now,
+            **common,
+            hit_block_ids_by_group=block_ids,
+            hit_block_ref_cnt_before_touch_by_group=ref_cnts,
+            hit_physical_block_hashes_by_group=physical_hashes,
+            prompt_block_hashes=self._prompt_hash_records(request),
         )
 
     def on_schedule(
@@ -216,6 +321,17 @@ class KVLifecycleTracer:
         )
         if len(previous_ids) < len(current_ids):
             new_block_ids += current_ids[len(previous_ids) :]
+        prefix_hit_ids = tuple(set(group) for group in state.prefix_hit_block_ids)
+        reused_block_ids = tuple(
+            tuple(block_id for block_id in group if block_id in hit_group)
+            for group, hit_group in zip(new_block_ids, prefix_hit_ids, strict=False)
+        )
+        if len(prefix_hit_ids) < len(new_block_ids):
+            reused_block_ids += tuple(() for _ in new_block_ids[len(prefix_hit_ids) :])
+        allocated_block_ids = tuple(
+            tuple(block_id for block_id in group if block_id not in reused_group)
+            for group, reused_group in zip(new_block_ids, reused_block_ids, strict=True)
+        )
         state.last_block_ids = current_ids
         state.peak_blocks = max(state.peak_blocks, snapshot["total_block_references"])
         step = {
@@ -227,10 +343,14 @@ class KVLifecycleTracer:
             "num_computed_tokens_after_schedule": request.num_computed_tokens,
             "reserved_kv_tokens": reserved_kv_tokens,
             "new_block_count": sum(len(group) for group in new_block_ids),
+            "reused_block_count": sum(len(group) for group in reused_block_ids),
+            "allocated_block_count": sum(len(group) for group in allocated_block_ids),
             "allocation_duration_ms": allocation_duration_ms,
             "free_blocks_before_allocation": free_blocks_before_allocation,
             "free_blocks_after_allocation": free_blocks_after_allocation,
         }
+        if phase == "PREFILL":
+            state.prefill_tokens_scheduled += num_scheduled_tokens
         state.pending_steps.append(step)
         self._write_detail(
             "SCHEDULE_STEP",
@@ -238,6 +358,8 @@ class KVLifecycleTracer:
             request_id=request.request_id,
             **step,
             new_block_ids_by_group=new_block_ids,
+            reused_block_ids_by_group=reused_block_ids,
+            allocated_block_ids_by_group=allocated_block_ids,
             **snapshot,
         )
 
@@ -277,6 +399,8 @@ class KVLifecycleTracer:
             num_new_output_tokens=num_new_tokens,
             num_output_tokens=request.num_output_tokens,
             new_block_count=step["new_block_count"],
+            reused_block_count=step["reused_block_count"],
+            allocated_block_count=step["allocated_block_count"],
             allocation_duration_ms=step["allocation_duration_ms"],
             free_blocks_before_allocation=step["free_blocks_before_allocation"],
             free_blocks_after_allocation=step["free_blocks_after_allocation"],
@@ -341,6 +465,17 @@ class KVLifecycleTracer:
             tuple(block_pool.blocks[block_id].ref_cnt for block_id in group)
             for group in released_ids
         )
+        released_hashes = tuple(
+            tuple(
+                self._hash_hex(block_pool.blocks[block_id].block_hash)
+                for block_id in group
+            )
+            for group in released_ids
+        )
+        released_cached = tuple(
+            tuple(block_hash is not None for block_hash in group)
+            for group in released_hashes
+        )
         free_blocks = block_pool.get_num_free_blocks()
         release_ms = (
             (now - state.finish_time) * 1000 if state.finish_time is not None else None
@@ -387,6 +522,13 @@ class KVLifecycleTracer:
             "final_free_blocks": free_blocks,
             "num_preemptions": request.num_preemptions,
             "recompute_occurred": request.num_preemptions > 0,
+            "prefix_cache_enabled": self._prefix_cache_enabled,
+            "prefix_hit_tokens": state.prefix_hit_tokens,
+            "prefix_hit_block_references": sum(
+                len(group) for group in state.prefix_hit_block_ids
+            ),
+            "prefix_lookup_duration_ms": state.prefix_lookup_duration_ms,
+            "prefill_tokens_scheduled": state.prefill_tokens_scheduled,
         }
         self._write_core("FINISH_AFTER_RELEASE", now, **summary)
         self._write_core("REQUEST_SUMMARY", now, **summary)
@@ -396,4 +538,18 @@ class KVLifecycleTracer:
             **summary,
             released_block_ids_by_group=released_ids,
             released_ref_cnt_by_group=released_ref_cnts,
+            released_cached_by_group=released_cached,
+            released_physical_block_hashes_by_group=released_hashes,
+        )
+
+    def on_prefix_cache_reset(self, successful: bool) -> None:
+        now = time.monotonic()
+        block_pool = self._kv_cache_manager.block_pool
+        self._write_both(
+            "PREFIX_CACHE_RESET",
+            now,
+            successful=successful,
+            prefix_cache_enabled=self._prefix_cache_enabled,
+            num_free_blocks=block_pool.get_num_free_blocks(),
+            cached_hash_entries=len(block_pool.cached_block_hash_to_block),
         )
