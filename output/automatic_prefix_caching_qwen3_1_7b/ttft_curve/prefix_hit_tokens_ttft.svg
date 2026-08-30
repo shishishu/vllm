@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="620" viewBox="0 0 1080 620">
+  <rect width="100%" height="100%" fill="white" />
+  <style>text{font-family:Arial,sans-serif;fill:#202124}.axis{stroke:#5f6368;stroke-width:1}.grid{stroke:#dadce0;stroke-width:1}.range{stroke:#8ab4f8;stroke-width:2}.curve{stroke:#1a73e8;stroke-width:3;fill:none}.point{stroke:#1a73e8;stroke-width:2;fill:white}</style>
+  <text x="540.0" y="30" text-anchor="middle" font-size="20">Prefix reuse length → TTFT (2112-token prompt)</text>
+  <line class="grid" x1="90" y1="530.0" x2="1040" y2="530.0" />
+  <text x="80" y="534.0" text-anchor="end" font-size="12">0</text>
+  <line class="grid" x1="90" y1="412.5" x2="1040" y2="412.5" />
+  <text x="80" y="416.5" text-anchor="end" font-size="12">236</text>
+  <line class="grid" x1="90" y1="295.0" x2="1040" y2="295.0" />
+  <text x="80" y="299.0" text-anchor="end" font-size="12">471</text>
+  <line class="grid" x1="90" y1="177.5" x2="1040" y2="177.5" />
+  <text x="80" y="181.5" text-anchor="end" font-size="12">707</text>
+  <line class="grid" x1="90" y1="60.0" x2="1040" y2="60.0" />
+  <text x="80" y="64.0" text-anchor="end" font-size="12">943</text>
+  <line class="grid" x1="90.0" y1="60" x2="90.0" y2="530" />
+  <text x="90.0" y="555" text-anchor="middle" font-size="12">0</text>
+  <line class="grid" x1="322.1" y1="60" x2="322.1" y2="530" />
+  <text x="322.1" y="555" text-anchor="middle" font-size="12">512</text>
+  <line class="grid" x1="554.1" y1="60" x2="554.1" y2="530" />
+  <text x="554.1" y="555" text-anchor="middle" font-size="12">1024</text>
+  <line class="grid" x1="786.2" y1="60" x2="786.2" y2="530" />
+  <text x="786.2" y="555" text-anchor="middle" font-size="12">1536</text>
+  <line class="grid" x1="1018.2" y1="60" x2="1018.2" y2="530" />
+  <text x="1018.2" y="555" text-anchor="middle" font-size="12">2048</text>
+  <line class="grid" x1="1040.0" y1="60" x2="1040.0" y2="530" />
+  <text x="1040.0" y="555" text-anchor="middle" font-size="12">2096</text>
+  <line class="range" x1="90.0" y1="149.0" x2="90.0" y2="105.5" />
+  <line class="range" x1="148.0" y1="151.0" x2="148.0" y2="94.8" />
+  <line class="range" x1="206.0" y1="160.1" x2="206.0" y2="122.5" />
+  <line class="range" x1="264.0" y1="171.5" x2="264.0" y2="130.4" />
+  <line class="range" x1="322.1" y1="184.0" x2="322.1" y2="156.3" />
+  <line class="range" x1="380.1" y1="195.6" x2="380.1" y2="160.8" />
+  <line class="range" x1="438.1" y1="222.2" x2="438.1" y2="186.9" />
+  <line class="range" x1="496.1" y1="236.1" x2="496.1" y2="200.3" />
+  <line class="range" x1="554.1" y1="255.6" x2="554.1" y2="227.8" />
+  <line class="range" x1="612.1" y1="285.7" x2="612.1" y2="264.7" />
+  <line class="range" x1="670.2" y1="311.4" x2="670.2" y2="280.9" />
+  <line class="range" x1="728.2" y1="337.0" x2="728.2" y2="306.1" />
+  <line class="range" x1="786.2" y1="361.5" x2="786.2" y2="340.6" />
+  <line class="range" x1="844.2" y1="391.1" x2="844.2" y2="368.7" />
+  <line class="range" x1="902.2" y1="430.0" x2="902.2" y2="425.9" />
+  <line class="range" x1="960.2" y1="459.7" x2="960.2" y2="450.5" />
+  <line class="range" x1="1018.2" y1="498.1" x2="1018.2" y2="492.5" />
+  <line class="range" x1="1040.0" y1="515.2" x2="1040.0" y2="505.4" />
+  <polyline class="curve" points="90.0,142.3 148.0,110.2 206.0,150.5 264.0,164.1 322.1,172.0 380.1,187.4 438.1,217.2 496.1,228.1 554.1,247.1 612.1,277.9 670.2,298.2 728.2,323.3 786.2,354.7 844.2,385.8 902.2,426.7 960.2,455.4 1018.2,493.7 1040.0,510.1" />
+  <circle class="point" cx="90.0" cy="142.3" r="4" />
+  <circle class="point" cx="148.0" cy="110.2" r="4" />
+  <circle class="point" cx="206.0" cy="150.5" r="4" />
+  <circle class="point" cx="264.0" cy="164.1" r="4" />
+  <circle class="point" cx="322.1" cy="172.0" r="4" />
+  <circle class="point" cx="380.1" cy="187.4" r="4" />
+  <circle class="point" cx="438.1" cy="217.2" r="4" />
+  <circle class="point" cx="496.1" cy="228.1" r="4" />
+  <circle class="point" cx="554.1" cy="247.1" r="4" />
+  <circle class="point" cx="612.1" cy="277.9" r="4" />
+  <circle class="point" cx="670.2" cy="298.2" r="4" />
+  <circle class="point" cx="728.2" cy="323.3" r="4" />
+  <circle class="point" cx="786.2" cy="354.7" r="4" />
+  <circle class="point" cx="844.2" cy="385.8" r="4" />
+  <circle class="point" cx="902.2" cy="426.7" r="4" />
+  <circle class="point" cx="960.2" cy="455.4" r="4" />
+  <circle class="point" cx="1018.2" cy="493.7" r="4" />
+  <circle class="point" cx="1040.0" cy="510.1" r="4" />
+  <line class="axis" x1="90" y1="60" x2="90" y2="530" />
+  <line class="axis" x1="90" y1="530" x2="1040" y2="530" />
+  <text x="22" y="295.0" transform="rotate(-90 22 295.0)" text-anchor="middle" font-size="13">TTFT (ms)</text>
+  <text x="565.0" y="600" text-anchor="middle" font-size="13">Actual prefix hit tokens (16-token blocks)</text>
+  <text x="1040" y="48" text-anchor="end" font-size="11">Points: median; vertical line: min–max</text>
+</svg>

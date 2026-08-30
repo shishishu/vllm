@@ -15,7 +15,14 @@ Automatic Prefix Caching（APC）。重点回答：匹配条件与粒度、最�
 4. 请求结束时活动引用被解除，`ref_cnt` 可从 1 降到 0，但已提交的完整 Block 仍保留
    hash 和 KV 数据，进入可淘汰缓存，后续请求仍可命中；
 5. APC 主要减少 Prefill 计算量和 TTFT。Decode 的每 token 工作没有被省略，因此 TPOT
-   基本不变；共享 Prefix 的并发吞吐会因 Prefill 工作量下降而提高。
+   基本不变；共享 Prefix 的并发吞吐会因 Prefill 工作量下降而提高；
+6. 多并发时，Scheduler 串行执行 Prefix lookup 和 `ref_cnt` 更新，但多个活动请求可
+   同时引用相同 Physical Blocks，并在同一个 GPU batch 中使用它们；
+7. 复用 KV 不等于复用 Attention 输出。新 query 仍需读取共享 Prefix KV，分别计算
+   `QKᵀ`、统一 Softmax 和 weighted-V；不会持久化复制 Prefix KV，但 kernel 仍有正常
+   的 HBM→片上存储读取；
+8. 固定 Prompt 长度时，命中越长通常 TTFT 越低，但关系并非简单线性。新 query token
+   数和它们需要覆盖的 causal attention pairs 能更好解释曲线。
 
 机制问答见 [`TOPIC_3_FAQ.md`](TOPIC_3_FAQ.md)。
 
@@ -141,6 +148,48 @@ Decode 性能。四组 TPOT 很接近，符合“Prefix Cache 省 Prefill，不�
 
 ![Prompt 变化位置—Prefix 命中长度—TTFT](output/automatic_prefix_caching_qwen3_1_7b/prompt_change_prefix_hit_ttft.svg)
 
+### 5.3 固定 2112-token Prompt 的命中长度—TTFT 曲线
+
+新增独立实验，将 Seed 和 Probe 总长度都固定为 2112 tokens，实际 Prefix
+hit 从 0 逐步增加到 2096 tokens。每个点都执行“reset cache → Seed →
+Probe”，避免前一个 Probe 污染后一个点；每点 1 次预热、5 次计量，并且
+每轮随机化点位顺序。Output 固定为 1 token，使指标聚焦 TTFT。
+
+| Prefix hit | Hit blocks | Prefill scheduled | Median TTFT |
+| ---: | ---: | ---: | ---: |
+| 0 | 0 | 2112 | 777.49 ms |
+| 512 | 32 | 1600 | 717.92 ms |
+| 1024 | 64 | 1088 | 567.27 ms |
+| 1536 | 96 | 576 | 351.54 ms |
+| 1920 | 120 | 192 | 149.54 ms |
+| 2048 | 128 | 64 | 72.77 ms |
+| 2096 | 131 | 16 | 40.00 ms |
+
+从 0 命中增加到 2096 命中，中位 TTFT 下降 737.49 ms，降幅 94.86%。曲线
+总体下降，但不应期待逐点严格单调或与命中 tokens 简单线性：
+
+- 5 次样本下，128-token 命中点因系统抖动高于 0-token 点；其余中位数点
+  随命中增加而下降；
+- APC 省去命中 tokens 的 QKV/MLP 计算，但新 query 的 Attention 仍需读取已缓存
+  Prefix KV；
+- 用“新 query token 数 + causal attention 对数”拟合 TTFT，`R²=0.9960`，高于
+  只用 Prefill token 数做线性拟合的 `R²=0.9648`。
+
+令完整 Prompt 长度为 `N`，命中为 `P`，剩余新 query 数为 `M=N-P`。缓存命中后，
+Prefill 不再计算 Prefix→Prefix 的 Attention，只计算：
+
+```text
+Suffix→Prefix pairs = M × P
+Suffix→Suffix pairs = M × (M + 1) / 2
+总 causal pairs     = M × P + M × (M + 1) / 2
+```
+
+例如 `P=2048, M=64` 时，每个 head 只计算 133152 个 query-key pairs；完整 2112-token
+Prefill 需要 2231328 个，剩余约 5.97%。这解释了为什么命中增长会同时减少 token-wise
+QKV/MLP 工作和 causal Attention 工作，但不会消除新 query 对缓存 Prefix 的读取。
+
+![Prefix 命中长度—TTFT 曲线](output/automatic_prefix_caching_qwen3_1_7b/ttft_curve/prefix_hit_tokens_ttft.svg)
+
 ## 6. 一条原始 Trace 的解读
 
 Case A 第一条计量 Probe `9-b4067a59`：
@@ -220,6 +269,98 @@ Block `i` 的身份依赖 Block `0…i` 的全部前缀。修改第一个 token 
 按请求顺序处理 Prefix lookup 时，首个共享 Block 的 `ref_cnt_before_touch` 依次为
 `0,1,2,3,4,5,6,7`，证明并发请求共享的是相同 Physical Blocks，而不是复制 8 份。
 
+### 8.3 串行 lookup、并发持有与 mixed GPU batch
+
+“并发复用”要区分控制面和数据面：
+
+```text
+Scheduler 控制面：逐请求 lookup / touch，串行修改 ref_cnt
+请求生命周期：多个 Block Table 可同时指向同一 Physical Block
+GPU 数据面：同一 engine_step 中的请求组成 batched forward
+```
+
+以计量轮次中的共享 Block `P544` 为例，8 个 Probe lookup 前的引用数依次为
+`0,1,2,3,4,5,6,7`；touch 后依次成为 `1…8`。真实调度时间线为：
+
+```text
+engine_step 2282
+  前 7 个 Probe：PREFILL，各 scheduled=16
+  P544 ref_cnt=7
+
+engine_step 2283
+  前 7 个 Probe：DECODE，各 scheduled=1
+  第 8 个 Probe：PREFILL，scheduled=16
+  P544 ref_cnt=8
+```
+
+因此本轮不是“8 个请求从第一个 step 起同时到齐”，而是第 8 个请求在下一 step 加入，
+与前 7 个 Decode 请求组成 mixed batch。它们的 Block Table 都指向 `P544` 开始的同一组
+67 个 Prefix Blocks；各自只分配私有尾页和 Decode Blocks。
+
+请求依次结束时，`P544` 在每次 `FINISH_AFTER_RELEASE` 后的引用数严格为
+`7,6,5,4,3,2,1,0`，且始终 `cached=true`。所以：
+
+- `ref_cnt>1` 证明同一物理页存在重叠的活动持有者；
+- 相同 `engine_step` 再证明这些持有者是否处于同一个 GPU batch；
+- `ref_cnt` 单独不能证明 GPU 同批执行，也不表示 Attention 只计算一次。
+
+### 8.4 复用 Prefix 后，剩余 Prefill 与 Attention 如何执行
+
+假设命中 `P` tokens、剩余 `M` tokens。对每个 Transformer Layer：
+
+```text
+1. 只为 M 个 suffix tokens 计算 Q/K/V
+2. 将 suffix K/V 写入该请求新分配的私有 Blocks
+3. 通过 Block Table 直接读取缓存 Prefix K/V 和新 suffix K/V
+4. 只计算 suffix query rows 的 causal Attention
+5. 执行 output projection、residual 和 MLP，进入下一层
+```
+
+完整 Causal Attention 矩阵可拆成：
+
+```text
+                         Keys
+                   Prefix P    Suffix M
+Queries  Prefix P      A_pp       0
+         Suffix M      A_sp       A_ss
+```
+
+APC 跳过以前已经完成的 `A_pp`，但必须重新计算 `A_sp` 和 `A_ss`。对第 `j` 个 suffix
+query，Softmax 的统一上下文是全部 Prefix KV 加 `suffix[0:j+1]`，不能分别对 Prefix
+和 Suffix 做 Softmax 后简单相加。
+
+Block Table 只提供地址映射，不会把共享 Prefix KV 复制、拼接成每请求一份连续缓存。
+Attention backend 可按 KV tiles 做 online softmax，直接访问离散 Physical Blocks。
+但“没有持久化物理复制”不等于“无需搬运数据”：每层 kernel 仍需将 K/V 从 HBM
+读取到 L2、shared memory 或 registers 参与计算。
+
+Batch size 为 8 时，8 个请求可以读取同一组 Prefix Physical Blocks，但仍分别计算
+自己的 query、scores、Softmax 和输出。即使某一时刻 query 恰好相同，当前 APC 也不做
+跨请求 Attention-result 去重；GPU 只是用 batched/ragged kernel 并行执行这些逻辑
+Attention。共享地址可能带来 L2 命中，但不能据此假设 Prefix KV 只从 HBM 读取一次。
+
+### 8.5 部分命中请求混批会怎样
+
+若同一 step 中三个请求分别需要计算 `16 / 64 / 2112` tokens，Scheduler 可以构造
+ragged mixed batch，总 scheduled tokens 约为 2192。命中请求不会因为邻居 miss 而重算
+自己的 Prefix，但必须等待这一批 GPU forward 完成，所以长 miss 可能抬高短 hit 请求
+观测到的 TTFT。
+
+整体影响应分开看：
+
+| 指标 | 部分命中 mixed batch 的影响 |
+| --- | --- |
+| 命中请求自身计算量 | 仍按 `prompt-hit` 减少 |
+| 未命中请求计算量 | 不变 |
+| Batch step 耗时 | 由总 query tokens、上下文长度和 Attention 工作量共同决定 |
+| 命中请求 TTFT | 可能被同批长 Prefill 拖慢 |
+| 整体吞吐 | 通常高于全部 miss，但收益取决于命中率和命中长度 |
+
+本轮并发实验中的同一 Suite 内，Probe 的命中长度一致；尚未直接测量“hit 与 long miss
+同批”的 APC mixed-hit 曲线。上述结论来自实际 mixed Prefill/Decode 调度证据及计算
+路径，不能替代单独的 mixed-hit 性能实验。由于本 Topic 关闭 Chunked Prefill，长 miss
+若整段进入同一 step，干扰通常会更明显；开启 Chunked Prefill 后需要另行验证。
+
 ## 9. 缓存保留、释放与驱逐
 
 APC 没有建立第二份独立 KV 内存：可缓存 Block 与普通运行时 Block 共用 Block Pool。
@@ -256,6 +397,10 @@ prefill_tokens_scheduled == prompt_tokens - prefix_hit_tokens
 全部 300 个计量 Probe（每种 APC 模式 150 个）通过，分析结果中的
 `all_invariants_passed=true`。
 
+补充 TTFT 曲线包含 18 个命中点、每点 5 个计量样本，共 90 个 Probe；全部满足
+`实际 hit=目标 hit` 和 `prefill scheduled=2112-hit`。0→128 命中点出现唯一一次中位数
+非单调，已保留 min/max 和随机点位顺序，不将小样本抖动隐藏为严格单调结论。
+
 新增 Scheduler 单测覆盖：
 
 - 顺序 Seed → Probe 的 Block hash 命中、`ref_cnt 0→1`、复用/分配分类和释放后缓存；
@@ -286,6 +431,17 @@ VLLM_CACHE_ROOT=$PWD/tmp/vllm-cache \
 .venv/bin/python \
   examples/basic/offline_inference/analyze_automatic_prefix_caching.py \
   output/automatic_prefix_caching_qwen3_1_7b
+
+# 固定 2112-token Prompt，测量不同 Prefix hit 长度的 TTFT。
+.venv/bin/python \
+  examples/basic/offline_inference/automatic_prefix_caching_ttft_curve.py \
+  --model Qwen/Qwen3-1.7B \
+  --trace-dir output/automatic_prefix_caching_qwen3_1_7b/ttft_curve \
+  --output-tokens 1
+
+.venv/bin/python \
+  examples/basic/offline_inference/analyze_automatic_prefix_caching_ttft_curve.py \
+  output/automatic_prefix_caching_qwen3_1_7b/ttft_curve
 ```
 
 产物目录包含：
@@ -295,6 +451,8 @@ VLLM_CACHE_ROOT=$PWD/tmp/vllm-cache \
 - `kv_lifecycle_core_*.jsonl`：可直接阅读的核心时间线；
 - `kv_lifecycle_detail_*.jsonl.gz`：压缩后的完整 Block/hash/ref_cnt Trace；
 - `prompt_change_prefix_hit_ttft.svg`：要求的关系图。
+- `ttft_curve/`：固定 2112-token Prompt 的逐段 Prefix hit—TTFT 原始 Trace、
+  CSV、JSON 聚合与 SVG 曲线。
 
 绝对延迟包含 eager 模式和详细 Trace 的额外开销，适合解释机制和同机相对比较，不应
 直接作为无 Trace 的生产性能基准。

@@ -83,6 +83,10 @@ TPOT 基本不变：每个新 token 的 Decode 仍要读取当前完整上下文
 吞吐在共享 Prefix workload 下也会提高，因为 GPU 少做大量 Prefill；并发 8 时，本实验
 完全相同 Prompt 的 requests/s 提高 2.73 倍，共享 1024-token Prefix 提高 2.35 倍。
 
+固定 2112-token Prompt 的补充曲线中，命中从 0 增至 2096 后，TTFT 中位数从
+777.49 ms 降至 40.00 ms，降幅 94.86%。但命中长度与 TTFT 不是简单线性关系，因为
+剩余 query 除 QKV/MLP 外，还要对缓存 Prefix 执行 causal Attention。
+
 ## 9. Prefix Cache 开启后，每个请求是否复制一份命中 KV？
 
 不会。多个请求的 Block Table 可以指向相同 Physical Blocks，并通过 `ref_cnt` 保护
@@ -90,6 +94,8 @@ TPOT 基本不变：每个新 token 的 Decode 仍要读取当前完整上下文
 前的引用计数依次为 0、1、2、3、4、5、6、7。
 
 只有各请求不共享的后缀、尾部和后续 Decode KV 才需要分别分配 Physical Blocks。
+`ref_cnt>1` 能证明活动持有区间重叠，但要证明请求处于同一个 GPU batch，还要检查它们
+是否有相同 `engine_step`。
 
 ## 10. Prefix Cache 与单请求 Decode KV Cache 是一回事吗？
 
@@ -131,3 +137,117 @@ TPOT 基本不变：每个新 token 的 Decode 仍要读取当前完整上下文
 不能。实验使用 eager 模式、RTX 2080，并开启逐调度 step 的详细 JSONL Trace；绝对
 延迟包含日志和实验控制开销。结论适合验证机制及同机 APC-on/off 相对差异。生产评估
 应关闭详细 Tracer，并使用目标硬件、真实 Prompt 分布和并发模型重新 benchmark。
+
+## 15. 多并发复用是并行还是串行？
+
+两者都有，发生在不同层次：
+
+- Scheduler 按请求串行执行 Prefix lookup、Block touch 和 `ref_cnt` 更新；
+- 多个请求的 Block Table 可以同时指向相同 Physical Blocks；
+- 同一 `engine_step` 选中的请求进入一个 batched GPU forward。
+
+本实验并发 8 的真实 Trace 中，前 7 个 Probe 在 step 2282 做 Prefill；第 8 个在
+step 2283 加入，当时前 7 个做 Decode，形成“7 Decode + 1 Prefill”的 mixed batch。
+此时共享 Block `P544` 的 `ref_cnt=8`。
+
+## 16. `ref_cnt` 怎样反映并发共享过程？
+
+`P544` 从 Seed 结束后的 `ref_cnt=0, cached=true` 开始。8 个 Probe 依次 lookup/touch：
+
+```text
+lookup before touch: 0,1,2,3,4,5,6,7
+touch 后活动引用:   1,2,3,4,5,6,7,8
+请求依次结束后:     7,6,5,4,3,2,1,0
+cached:             始终 true
+```
+
+因此 `ref_cnt` 证明同一个 Physical Block 被多少活动 Block Table 持有，以及何时可以
+驱逐。它不记录 GPU 算术过程；判断同批执行还需联合 Physical Block ID、`engine_step`、
+phase 和 scheduled tokens。
+
+## 17. Batch size=8 时，是否只计算一次 Attention？
+
+不是。8 个请求共享同一份 Prefix K/V 物理存储，但各自仍有 Query，并分别计算：
+
+```text
+scores_i  = Q_i × K_context_iᵀ
+weights_i = softmax(scores_i + causal_mask)
+output_i  = weights_i × V_context_i
+```
+
+GPU 用 batched/ragged kernel 并行处理这些逻辑 Attention，不会计算一次 Attention
+output 后复制给 8 个请求。请求生成分叉后，Query 和私有历史不同，更不可能共享结果。
+
+## 18. 复用多数 KV 后，剩余 tokens 如何计算 KV？
+
+设命中 `P` tokens、剩余 `M` tokens。对每一层，只为 `M` 个 suffix tokens 计算新的
+Q/K/V，把新 K/V 写入该请求的私有 Blocks；Prefix Blocks 保持只读共享。
+
+第 `j` 个 suffix query 的上下文为：
+
+```text
+全部 Prefix K/V + suffix[0:j+1] 的 K/V
+```
+
+所有 `M` 个 Q/K/V projection 可批量计算，Attention 也可并行处理多个 query rows，
+用 causal mask 保证 suffix token 不能看到未来位置。
+
+## 19. 命中 Prefix 后，还需要计算“完整 Attention”吗？
+
+需要完整历史语义，但不需要重新计算全部 query rows。完整矩阵可拆为：
+
+```text
+                         Keys
+                   Prefix P    Suffix M
+Queries  Prefix P      A_pp       0
+         Suffix M      A_sp       A_ss
+```
+
+APC 跳过已完成的 `A_pp`，只计算 `A_sp + A_ss`。对每个 suffix query，Prefix 和可见
+suffix scores 必须参加同一个 Softmax，不能分别归一化后直接相加。
+
+计算量为：
+
+```text
+M × P + M × (M + 1) / 2
+```
+
+例如 `P=2048, M=64`，每个 head 计算 133152 个 query-key pairs，而完整 2112-token
+Prefill 为 2231328 个，剩余约 5.97%。
+
+## 20. Attention 时是否要搬运或复制 reused KV？
+
+不会把 Prefix KV 持久化复制成每请求一份，也不会为了 Attention 先拼成连续 K/V。
+Kernel 根据 Block Table 直接访问共享 Prefix Blocks 和私有 suffix Blocks。
+
+但 GPU 计算仍需正常读取数据：
+
+```text
+HBM → L2 → shared memory/registers → 计算单元
+```
+
+所以“无物理复制”不等于“无数据读取”。多个请求访问相同地址可能利用 L2，但不能仅凭
+APC 假设 Batch size=8 时 Prefix KV 只从 HBM 读取一次；这需要 GPU profiling 验证。
+
+## 21. 同一 batch 中只有部分请求命中，会怎样？
+
+每个请求仍只计算自己的 miss 部分。例如 scheduled tokens 为 `16/64/2112` 的三个
+请求可以组成 ragged mixed batch；前两个不会因第三个 miss 而重算 Prefix。
+
+但一次 GPU forward 是共同的同步边界，长 miss 会增加整个 step 的工作量，可能拖高
+短 hit 请求的 TTFT。整体吞吐通常仍优于全部 miss，具体收益取决于总新 query tokens、
+上下文长度、Attention 工作量、命中率和 GPU batch 效率。
+
+当前并发实验中同一 Suite 的 Probe 命中长度一致，没有直接测量 mixed hit/miss 同批；
+因此这部分是基于调度与计算路径的机制结论，仍应增加专门 workload 做定量验证。
+
+## 22. 为什么 Prefix hit—TTFT 曲线不是严格线性？
+
+命中增加会同时减少两类工作：
+
+1. 剩余 tokens 的 QKV/MLP 等 token-wise 计算；
+2. 剩余 query 对 Prefix 和 suffix 的 causal Attention pairs。
+
+仅用 `prefill_tokens` 线性拟合，本实验 `R²=0.9648`；加入 causal attention pairs 后
+`R²=0.9960`。另外，GPU kernel shape、固定开销、详细 Trace 和系统抖动会造成局部
+非单调；18 个点中只有 0→128 命中出现一次中位数上升，不能据此否定总体趋势。
